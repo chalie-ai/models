@@ -1,0 +1,4 @@
+# Model files go in GitHub Releases, not in the repo
+*.safetensors
+*.onnx
+*.bin
