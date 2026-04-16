@@ -9,8 +9,7 @@ Models are distributed as GitHub Release assets. Releases ship **per-task MLP he
 
 | Model | Architecture | Classes | Test accuracy | Head size | Status |
 |-------|--------------|---------|---------------|-----------|--------|
-| `contradiction` | MLP head over shared gte-modernbert-base | 5 | 99.95% | 775 KB | v0.9.0 |
-| `thinking-level` | MLP head over shared gte-modernbert-base + 4-dim prev_level one-hot | 3 | 88.44% (92.3% @ t≥0.70) | 777 KB | v0.9.0 |
+| `thinking-level` | MLP head over shared gte-modernbert-base + 4-dim prev_level one-hot | 3 | 88.44% (92.3% @ t≥0.70) | 777 KB | v0.9.1 |
 
 ## Architecture
 
@@ -29,7 +28,9 @@ All current models share a single frozen encoder plus a per-task 2-layer MLP hea
 
 Retired: the Qwen2.5-0.5B single-token classifier design (v0.8 and earlier), `mode-tiebreaker`,
 `trait-detector`, `skill-selector`, and `social-filter` were all dropped in the shared-encoder
-pivot (training-pipeline commit `0361cfe`).
+pivot (training-pipeline commit `0361cfe`). The `contradiction` classifier was briefly shipped in
+v0.9.0 then removed — Chalie's memory subsystem does not consume it. Training-repo commit
+`a5f0646` is the last known-good state for the contradiction task should it ever be revived.
 
 ## Usage
 
@@ -38,9 +39,6 @@ Download release assets and place them under `backend/data/models/<task>/`:
 ```
 backend/data/models/
 ├── gte-modernbert-base/onnx/model.onnx        (shared base — already in Chalie)
-├── contradiction/
-│   ├── contradiction_head.npz
-│   └── classifier_meta.json
 └── thinking_level/
     ├── thinking-level_head.npz
     └── classifier_meta.json
@@ -48,21 +46,7 @@ backend/data/models/
 
 ## Model Details
 
-### contradiction (v0.9.0)
-
-5-class contradiction-resolution classifier for Chalie's memory subsystem. Classifies how a
-pair of statements relates: genuine contradiction, temporal change, context-dependent,
-figurative, or compatible.
-
-- **Architecture**: MLP head over shared gte-modernbert-base (768-d embedding → 256 hidden → 5 logits)
-- **Input**: the current JSON blob alone — no `Options: A..E\nAnswer:` suffix (contract retired in the pivot)
-- **Labels (pinned index order)**: `["temporal_change", "true_contradiction", "context_dependent", "figurative", "compatible"]`
-- **Training data**: ~51K samples, group-aware split
-- **Test accuracy**: 99.95% overall (7,744 / 7,748), all classes ≥99.9%
-- **Confidence separation**: correct 0.962 vs wrong 0.485
-- **Gate performance at t≥0.70**: 100% acc at 99.2% coverage
-
-### thinking-level (v0.9.0)
+### thinking-level (v0.9.1)
 
 3-class deliberation-depth gate sitting in front of Chalie's ACT loop. Predicts whether the
 incoming user turn deserves `low` / `medium` / `high` thinking budget.
