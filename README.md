@@ -10,6 +10,7 @@ Models are distributed as GitHub Release assets. Releases ship **per-task MLP he
 | Model | Architecture | Classes | Test accuracy | Head size | Status |
 |-------|--------------|---------|---------------|-----------|--------|
 | `thinking-level` | MLP head over shared gte-modernbert-base + 4-dim prev_level one-hot | 3 | 88.44% (92.3% @ t≥0.70) | 777 KB | v0.9.1 |
+| `mode-detector`  | MLP head over shared gte-modernbert-base (multi-label, 8 sigmoid heads)    | 8 | 79.7% macro F1 (calibrated) / 46.6% exact-match | 778 KB | v0.10.0 |
 
 ## Architecture
 
@@ -22,7 +23,10 @@ All current models share a single frozen encoder plus a per-task 2-layer MLP hea
 - **Per-task head**: `Linear(input_dim → hidden_dim) → GELU → Dropout(train-only) → Linear(hidden_dim → num_classes)`.
   Weights (W1, b1, W2, b2) stored as float32 in a `<model-name>_head.npz`. The `classifier_meta.json`
   sidecar records `hidden_dim`, `activation`, `base_encoder_sha256`, label order, and (for tasks with
-  structural features) the prev_level one-hot layout.
+  structural features) the prev_level one-hot layout. Multi-label tasks additionally carry
+  `task_type: "multi_label"`, `output_activation: "sigmoid"`, `num_heads`, `default_threshold`,
+  and a calibrated `per_mode_thresholds` vector (one cutoff per head) — the loader must apply
+  these per-head rather than a flat threshold.
 - **Revision pin check**: loaders must refuse to boot if
   `classifier_meta.json::base_encoder_sha256` ≠ sha256 of the ONNX Chalie is actually loading.
 
@@ -39,8 +43,11 @@ Download release assets and place them under `backend/data/models/<task>/`:
 ```
 backend/data/models/
 ├── gte-modernbert-base/onnx/model.onnx        (shared base — already in Chalie)
-└── thinking_level/
-    ├── thinking-level_head.npz
+├── thinking_level/
+│   ├── thinking-level_head.npz
+│   └── classifier_meta.json
+└── mode_detector/
+    ├── mode-detector_head.npz
     └── classifier_meta.json
 ```
 
@@ -85,3 +92,68 @@ ambiguous turns inherit the active conversation's deliberation depth rather than
 
 See the training repo `data/tasks/thinking_level/{SIGNALS.md,INTEGRATION.md}` for the full
 signal contract and Chalie-side wrapper spec.
+
+### mode-detector (v0.10.0)
+
+8-head multi-label cognitive-mode classifier. Takes a single user message and emits 8 independent
+sigmoid probabilities — one per abstract intent. Chalie's tool router consumes these to promote
+tools to *innate* (always-loaded) vs leave them *discoverable* (lazy-loaded via `find_tools`) per turn.
+
+- **Architecture**: MLP head over shared gte-modernbert-base. Input is the 768-d pooled embedding
+  (no prev-state feature — temporal smoothing is the caller's responsibility) → 256 hidden →
+  8 sigmoid heads. `BCEWithLogitsLoss` (per-head independent binary cross-entropy).
+- **Input**: raw user turn. No prefix / suffix / options list. No conversation history.
+- **Output**: 8 floats in `[0, 1]`, independent. **Not a distribution — they do NOT sum to 1.**
+  Multiple heads can fire simultaneously (compound intents are a first-class training case).
+- **Labels (pinned index order)**: `["research", "coding", "brainstorm", "analyze", "plan", "write", "math", "converse"]`
+- **Classes**:
+  - `research` — gather external info (lookup, papers, products, news, facts)
+  - `coding` — write / debug / refactor / review / explain code
+  - `brainstorm` — generate options, ideas, possibilities, "what if", "give me N ideas"
+  - `analyze` — process given input (compare, summarize, critique, classify)
+  - `plan` — sequence steps, schedule, decompose goals, roadmap
+  - `write` — produce prose (drafts, emails, docs, creative)
+  - `math` — quantitative reasoning (calc, stats, proofs, symbolic manipulation)
+  - `converse` — social / emotional / chitchat / advice, no underlying task
+- **Calibrated per-mode thresholds** (from `classifier_meta.json::per_mode_thresholds`, tuned on
+  the 5,286-row held-out test set to maximise per-head F1):
+
+  | mode | threshold | rationale |
+  |------|-----------|-----------|
+  | `research`   | 0.33 | head well-calibrated at low probs; flat 0.4 silently missed implicit phrasings |
+  | `coding`     | 0.82 | very high-confidence head; most true positives land above 0.9 |
+  | `brainstorm` | 0.60 | modest tighten; head slightly over-fires |
+  | `analyze`    | 0.50 | weakest head; raising past 0.5 hurts recall more than the precision gain is worth |
+  | `plan`       | 0.80 | high-confidence head; tighten to kill FPs |
+  | `write`      | 0.72 | confident; cut FPs leaking from research |
+  | `math`       | 0.93 | extremely confident; anything below 0.9 is noise |
+  | `converse`   | 0.55 | mild tighten; bleeds into research / brainstorm |
+
+  **Do not use a flat 0.4 cutoff in production** — it costs ~6pp macro F1 and ~12pp exact-match
+  vs the calibrated vector. Loaders should read `per_mode_thresholds` from meta and apply per head.
+- **Training data**: ~24.4k seeds — ~9.8k hand-crafted (`provenance: "sonnet"`) in 5 categories
+  (basic / compound / ambiguous / complex / null), plus ~14.6k external imports (Dolly + no_robots,
+  `provenance: "external"`). After 12× Gemma+Qwen variant expansion the train pool is ~81% external.
+  Split strategy is `source`: variants always go to train; sonnet parents always go to test;
+  external parents split 10% test / 90% train via deterministic MD5 hash on `seed_id`.
+- **Test accuracy (calibrated)**: macro F1 79.7%, exact-match 46.6%, Hamming 90.7%
+  (vs flat t=0.4 baseline: 73.7% / 34.9% / 87.6%).
+- **Known biases**:
+  - **Zero external seeds for `plan` or `math`** — Dolly and no_robots have no examples for these
+    modes. Both heads are trained mostly on sonnet + variants. Real-world `plan` / `math` phrasings
+    outside the sonnet distribution may be miscalibrated.
+  - **`research` is the saturated head** — external pool skew toward research / write / analyze
+    means the research head fires early (threshold 0.33). It's well-calibrated at low probs, but
+    callers that want a sharper research signal should layer a second check rather than raise the
+    threshold (which hurts recall on implicit phrasings like "run a web search for X").
+  - **`null` category exists** — some prompts ("thanks", "hey", "asdfgh") are trained to output
+    all-zero. Do not force at least one mode to fire.
+  - **Compound training** — ~20% of training examples have two modes firing (primary=1.0,
+    secondary=0.7). Expect 2 fires on genuinely compound prompts ("should I switch from Python to
+    Rust, give me pros and cons" → `analyze` + `research`).
+- **Rollout**: Phase 1 is shadow mode (log-only, `shadow_mode: true` in the training config).
+  Phase 2 drives tool-router promotion decisions in `UserMessageProcessor` based on a per-turn
+  EMA-smoothed accumulator over the 8 head outputs.
+
+See the training repo `data/tasks/mode_detector/SEED_SPEC.md` for the seed authoring contract,
+provenance routing rules, and the external-imbalance caveats in full.
