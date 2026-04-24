@@ -9,8 +9,9 @@ Models are distributed as GitHub Release assets. Releases ship **per-task MLP he
 
 | Model | Architecture | Classes | Test accuracy | Head size | Status |
 |-------|--------------|---------|---------------|-----------|--------|
-| `thinking-level` | MLP head over shared gte-modernbert-base + 4-dim prev_level one-hot | 3 | 88.44% (92.3% @ t≥0.70) | 777 KB | v0.9.1 |
+| `deliberation-score` | MLP head over shared gte-modernbert-base (scalar regression, sigmoid output) | 1 | MAE 0.085 / bucket-acc 83.3% (calibrated) | 771 KB | v0.11.0 |
 | `mode-detector`  | MLP head over shared gte-modernbert-base (multi-label, 8 sigmoid heads)    | 8 | 79.7% macro F1 (calibrated) / 46.6% exact-match | 778 KB | v0.10.0 |
+| `thinking-level` | MLP head over shared gte-modernbert-base + 4-dim prev_level one-hot | 3 | 88.44% (92.3% @ t≥0.70) | 777 KB | **retired (v0.9.1)** — superseded by `deliberation-score` |
 
 ## Architecture
 
@@ -20,13 +21,17 @@ All current models share a single frozen encoder plus a per-task 2-layer MLP hea
   `e7f32e3c00f91d699e8c43b53106206bcc72bb22`, sha256
   `947f31df7effaeec4edb57c50e4ed7e0f2034d9336063f92615b92e3e0d24d78`. Not shipped
   here — Chalie already loads it for embeddings.
-- **Per-task head**: `Linear(input_dim → hidden_dim) → GELU → Dropout(train-only) → Linear(hidden_dim → num_classes)`.
+- **Per-task head**: `Linear(input_dim → hidden_dim) → GELU → Dropout(train-only) → Linear(hidden_dim → num_outputs)`.
   Weights (W1, b1, W2, b2) stored as float32 in a `<model-name>_head.npz`. The `classifier_meta.json`
   sidecar records `hidden_dim`, `activation`, `base_encoder_sha256`, label order, and (for tasks with
   structural features) the prev_level one-hot layout. Multi-label tasks additionally carry
   `task_type: "multi_label"`, `output_activation: "sigmoid"`, `num_heads`, `default_threshold`,
   and a calibrated `per_mode_thresholds` vector (one cutoff per head) — the loader must apply
-  these per-head rather than a flat threshold.
+  these per-head rather than a flat threshold. Regression tasks carry
+  `task_type: "regression"`, `output_activation: "sigmoid"`, `num_outputs: 1`,
+  `extra_feature_dim: 0`, plus `bucket_thresholds` (`{high, medium}`) and
+  `ema_alpha` — the runtime applies EMA smoothing across turns and gates the
+  smoothed scalar through the two thresholds into `low / medium / high`.
 - **Revision pin check**: loaders must refuse to boot if
   `classifier_meta.json::base_encoder_sha256` ≠ sha256 of the ONNX Chalie is actually loading.
 
@@ -43,17 +48,92 @@ Download release assets and place them under `backend/data/models/<task>/`:
 ```
 backend/data/models/
 ├── gte-modernbert-base/onnx/model.onnx        (shared base — already in Chalie)
-├── thinking_level/
-│   ├── thinking-level_head.npz
+├── deliberation_score/
+│   ├── deliberation-score_head.npz
 │   └── classifier_meta.json
 └── mode_detector/
     ├── mode-detector_head.npz
     └── classifier_meta.json
 ```
 
+The `thinking_level` task is retired as of v0.11.0 — delete
+`backend/data/models/thinking_level/` after installing `deliberation_score`.
+
 ## Model Details
 
-### thinking-level (v0.9.1)
+### deliberation-score (v0.11.0)
+
+Scalar regression head replacing the retired `thinking-level` 3-class softmax. Predicts a single
+float ∈ `[0, 1]` answering *"how much reasoning should the model do before replying?"*. Chalie's
+runtime smooths the raw scalar with an EMA across turns, then gates the smoothed value through
+two thresholds into `low / medium / high` buckets — same downstream contract as `thinking-level`.
+
+- **Architecture**: MLP head over shared gte-modernbert-base. Input is the 768-d pooled L2-normalised
+  embedding (no `prev_level` one-hot — `extra_feature_dim=0`). Shape: 768 → 256 (GELU) → 1 sigmoid.
+  `BCEWithLogitsLoss` on the scalar — BCE's tail gradient behaviour keeps calibration alive at
+  target=0.9 / 1.0 where MSE would collapse.
+- **Input**: raw user turn. No prefix / suffix / options list. No conversation history.
+- **Output**: single float ∈ `[0, 1]`. **Not a label, not a confidence** — a runtime-time guidance
+  signal that the caller smooths and gates.
+- **Reference scale** (from `data/tasks/deliberation_score/SIGNALS.md`):
+  - `0.1` — trivial chit-chat / template reply
+  - `0.3` — simple one-step reply (factoid, rename, obvious code tweak)
+  - `0.5` — moderate 2–3 step reasoning; compare, draft, plan-a-little
+  - `0.7` — deep reasoning warranted; multi-constraint / genuine ambiguity
+  - `0.9` — synthesis under ambiguity; formal proof; adversarial prompt
+- **Calibrated bucket thresholds** (from `classifier_meta.json::bucket_thresholds`, tuned on the
+  4,995-parent held-out sonnet/opus test set to maximise bucket accuracy):
+
+  | bucket | threshold | runtime effect |
+  |--------|-----------|----------------|
+  | `high`    | 0.67 | enable scratchpad + tool planner (`thinking_mode="think"`) |
+  | `medium`  | 0.46 | enable scratchpad, single pass |
+  | `low`     | —    | fast path, no deliberation lift |
+
+  `high` moved from the rubric default 0.70 → 0.67 to compensate for systematic under-prediction at
+  tier 0.7 (tier-0.7 mean predicted scalar = 0.773, std 0.085 — tail of tier-0.6 crosses 0.70 more
+  often than tail of tier-0.7 falls below it). Loaders must read `bucket_thresholds` from meta and
+  apply the two-step gate `if s_t > high: high elif s_t > medium: medium else: low`.
+- **EMA smoothing**: `classifier_meta.json::ema_alpha = 0.6`.
+  `s_t = α·s_{t-1} + (1-α)·scalar_t`, seeded `s_0 = scalar_0`. The bucket gate reads `s_t`, never
+  the raw `scalar_t`. Where EMA state lives is Chalie's decision — see the v0.11.0 integration
+  plan in `chalie-plans/v0.11.0/`.
+- **Training data**: 4,995 hand-authored seeds across ten tiers `{0.1, 0.2, …, 1.0}`:
+  - Phase 3a: ~2,500 sonnet-authored odd tiers `{0.1, 0.3, 0.5, 0.7, 0.9}`.
+  - Phase 3b: ~2,495 opus-authored even tiers `{0.2, 0.4, 0.6, 0.8, 1.0}` with explicit
+    length-decorrelation floors. Corpus length↔target Pearson dropped from ~1.0 (Phase 3a alone)
+    to 0.838.
+  - Cross-tier semantic dedup via gte-modernbert cosine: two passes (threshold + hand-approved
+    allowlist) produced 67 target updates / 29 clusters, yielding 19 distinct targets (10 tier
+    values + 9 dedup-averaged off-tier corrections like 0.1357, 0.55, 0.6500).
+  - Phase 4: 8-axis Gemma4:26b variant expansion (terse, verbose, broken-english, texting, formal,
+    casual-slang, typo-heavy, emoji-laced) → 37,978 unique variants. Source-split strategy:
+    variants → train, sonnet/opus parents → test.
+- **Test accuracy**: MAE `0.0853`, bucket-accuracy `83.26%` on 4,995 parent seeds.
+  - Per-tier MAE is worst at the 0.4 / 0.8 tiers (both ~0.11) — the 0.7 / 0.8 pair collapses
+    because the frozen encoder cannot cleanly partition adjacent tier bands (same structural
+    ceiling that capped the retired `thinking-level` softmax). BCE-sigmoid asymptote also
+    under-predicts tier 1.0 (mean = 0.904, expected).
+- **Why scalar** (vs v0.9's 3-class softmax): v0.9 plateaued at 88.4% top-1 — the limit came
+  from short continuation prompts of neighbouring classes sharing too much lexical surface for
+  mean-pooled 768-d embeddings to partition. Capacity bumps regressed; seeds audited clean.
+  A smooth scalar learns the *ordering* without forcing a clean partition (0.68 vs 0.72 vs 0.75
+  can separate even when softmax buckets collapse), and bucket boundaries move out of the weights
+  into a config knob retunable post-hoc without retraining.
+- **Deployment**: ships **live**, not shadowed. Thresholds are calibrated pre-release on the
+  held-out test set — no live-traffic observation, no post-deploy retuning. Calibration is a
+  training-side pre-release step (`scripts/calibrate_regression_buckets.py`); downstream never
+  writes back.
+
+See the training repo `data/tasks/deliberation_score/{SIGNALS.md,INTEGRATION.md,SEED_SPEC.md}`
+for the full signal contract, runtime loader spec, and seed-authoring rubric. Consumer-side
+integration plan lives in `chalie-plans/v0.11.0/2026-04-24-deliberation-score-integration.md`.
+
+### thinking-level (v0.9.1) — RETIRED
+
+**As of v0.11.0: superseded by `deliberation-score`.** The 3-class softmax is no longer trained
+or shipped. Keep this section as historical context; any running Chalie instance should retire
+the `backend/data/models/thinking_level/` directory after installing v0.11.0.
 
 3-class deliberation-depth gate sitting in front of Chalie's ACT loop. Predicts whether the
 incoming user turn deserves `low` / `medium` / `high` thinking budget.
